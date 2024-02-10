@@ -1,0 +1,20 @@
+go 1.21.1
+
+use (
+	./charles_communicator
+	./common
+	./device_info
+	./network_info
+	./gablogger
+	./initializer
+	./main
+	./monitor
+	./mqtt_connector
+	./peripherals
+	./scheduler
+	./socketxp
+	./updater
+	./utils
+	./event_control
+	./api
+)

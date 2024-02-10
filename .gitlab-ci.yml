@@ -1,0 +1,216 @@
+stages:
+  - check-tags-and-merges
+  - build
+  - upload-to-registry
+  - release
+  - upload-to-sftp
+  - send-to-mqtt
+variables:
+  PACKAGE_REGISTRY_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/charles-go/${CI_COMMIT_TAG}"
+
+check-tags-and-merges:
+  stage: check-tags-and-merges
+  image: alpine:latest
+  script:
+    - |
+      if [ "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" == "staging" ] && [ "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" != "develop" ]; then
+        exit 1
+      fi
+    - |
+      if [ "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" == "main" ] && [ "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" != "staging" ]; then
+        exit 1
+      fi
+  only:
+    - merge_requests
+
+check-tag_creation:
+  stage: check-tags-and-merges
+  script:
+    - git fetch &> /dev/null
+    - CI_COMMIT_BRANCHES=$(git for-each-ref | grep $CI_COMMIT_SHA | grep /remotes/origin/ | sed "s/.*\///")
+    - if [ "$CI_COMMIT_BRANCHES" != "main" ]; then
+        echo "You can only create tags from the main branch.";
+        exit 1;
+      fi
+  only:
+    - tags
+
+build-develop:
+  stage: build
+  image: golang:1.21
+  before_script:
+    - VERSION=$(echo -ne "develop-" && TZ=America/Sao_Paulo date +%-d.%-H.%-M)
+    - echo "VERSION=$VERSION" >> .env
+    - cat $DEV_ENV_FILE >> .env
+    - mkdir bin
+    - echo "$VERSION" > bin/version.txt
+  script:
+    - ./build.sh
+  artifacts:
+    paths:
+      - bin
+  only:
+    - develop
+
+build-staging:
+  stage: build
+  image: golang:1.21
+  before_script:
+    - VERSION=$(echo -ne "staging-" && TZ=America/Sao_Paulo date +%-d.%-H.%-M)
+    - echo "VERSION=$VERSION" >> .env
+    - cat $STAGING_ENV_FILE >> .env
+    - mkdir bin
+    - echo "$VERSION" > bin/version.txt
+  script:
+    - ./build.sh
+  artifacts:
+    paths:
+      - bin
+  only:
+    - staging
+
+build-prod:
+  stage: build
+  image: golang:1.21
+  before_script:
+    - echo "VERSION=$CI_COMMIT_TAG" >> .env
+    - cat $PROD_ENV_FILE >> .env
+    - mkdir bin
+    - echo "$CI_COMMIT_TAG" > bin/version.txt
+  script:
+    - ./build.sh
+  artifacts:
+    paths:
+      - bin
+  only:
+    - tags
+
+upload-to-registry:
+  stage: upload-to-registry
+  script:
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file bin/CharlesGo "${PACKAGE_REGISTRY_URL}/CharlesGo"'
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file bin/LinuxGo "${PACKAGE_REGISTRY_URL}/LinuxGo"'
+  only:
+    - tags
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - 'release-cli create --name "CharlesGo-$CI_COMMIT_TAG" --tag-name $CI_COMMIT_TAG --assets-link "{\"name\":\"CharlesGo-${CI_COMMIT_TAG}\", \"url\":\"${PACKAGE_REGISTRY_URL}/CharlesGo\"}" --assets-link "{\"name\":\"LinuxGo-${CI_COMMIT_TAG}\", \"url\":\"${PACKAGE_REGISTRY_URL}/LinuxGo\"}"'
+  only:
+    - tags
+
+upload-to-sftp-dev:
+  stage: upload-to-sftp
+  image: alpine
+  script:
+    - apk add sshpass openssh
+    - cat $DEV_ENV_FILE >> .env && source .env
+    - CHARLES_GO_VERSION=$(cat bin/version.txt)
+    - |
+      {
+        echo -mkdir Files/charles-go
+        echo -mkdir Files/charles-go/$ENVIRONMENT
+        echo -mkdir Files/charles-go/$ENVIRONMENT/$CHARLES_GO_VERSION
+        echo -cd Files/charles-go/$ENVIRONMENT/$CHARLES_GO_VERSION
+        echo -put bin/CharlesGo CharlesGo
+      } | sshpass -v -p $SFTP_DEPLOY_PASS sftp -o StrictHostKeyChecking=no $SFTP_DEPLOY_USER@$SFTP_SERVER
+  only:
+    - develop
+
+upload-to-sftp-staging:
+  stage: upload-to-sftp
+  image: alpine
+  script:
+    - apk add sshpass openssh
+    - cat $STAGING_ENV_FILE >> .env && source .env
+    - CHARLES_GO_VERSION=$(cat bin/version.txt)
+    - |
+      {
+        echo -mkdir Files/charles-go
+        echo -mkdir Files/charles-go/$ENVIRONMENT
+        echo -mkdir Files/charles-go/$ENVIRONMENT/$CHARLES_GO_VERSION
+        echo -cd Files/charles-go/$ENVIRONMENT/$CHARLES_GO_VERSION
+        echo -put bin/CharlesGo CharlesGo
+      } | sshpass -v -p $SFTP_DEPLOY_PASS sftp -o StrictHostKeyChecking=no $SFTP_DEPLOY_USER@$SFTP_SERVER
+  only:
+    - staging
+
+upload-to-sftp-prod:
+  stage: upload-to-sftp
+  image: alpine
+  script:
+    - apk add sshpass openssh
+    - cat $PROD_ENV_FILE >> .env && source .env
+    - CHARLES_GO_VERSION=$(cat bin/version.txt)
+    - |
+      { 
+        echo -mkdir Files/charles-go
+        echo -mkdir Files/charles-go/$ENVIRONMENT
+        echo -mkdir Files/charles-go/$ENVIRONMENT/$CHARLES_GO_VERSION
+        echo -cd Files/charles-go/$ENVIRONMENT/$CHARLES_GO_VERSION
+        echo -put bin/CharlesGo CharlesGo
+      } | sshpass -v -p $SFTP_DEPLOY_PASS sftp -o StrictHostKeyChecking=no $SFTP_DEPLOY_USER@$SFTP_SERVER
+  only:
+    - tags
+
+send-to-mqtt-dev:
+  stage: send-to-mqtt
+  image: emqx/mqttx-cli
+  script:
+    - cat $DEV_ENV_FILE >> .env && source .env
+    - CHARLES_GO_VERSION=$(cat bin/version.txt)
+    - SHA256=$(sha256sum bin/CharlesGo | awk '{print $1}')
+    - MQTT_TOPIC="environments/$ENVIRONMENT/charles-go/version"
+    - |
+      MQTT_MESSAGE=$(cat <<EOF
+      {
+        "version": "$CHARLES_GO_VERSION",
+        "sha256sum": "$SHA256"
+      }
+      EOF
+      )
+    - mqttx pub -h $MQTT_BROKER -p $MQTT_PORT -u $MQTT_USER_DEPLOY -P "$MQTT_PASS_DEPLOY" -t $MQTT_TOPIC -m "$MQTT_MESSAGE" --insecure -r --qos 2 --protocol mqtts
+  only:
+    - develop
+
+send-to-mqtt-staging:
+  stage: send-to-mqtt
+  image: emqx/mqttx-cli
+  script:
+    - cat $STAGING_ENV_FILE >> .env && source .env
+    - CHARLES_GO_VERSION=$(cat bin/version.txt)
+    - SHA256=$(sha256sum bin/CharlesGo | awk '{print $1}')
+    - MQTT_TOPIC="environments/$ENVIRONMENT/charles-go/version"
+    - |
+      MQTT_MESSAGE=$(cat <<EOF
+      {
+        "version": "$CHARLES_GO_VERSION",
+        "sha256sum": "$SHA256"
+      }
+      EOF
+      )
+    - mqttx pub -h $MQTT_BROKER -p $MQTT_PORT -u $MQTT_USER_DEPLOY -P "$MQTT_PASS_DEPLOY" -t $MQTT_TOPIC -m "$MQTT_MESSAGE" --insecure -r --qos 2 --protocol mqtts
+  only:
+    - staging
+
+send-to-mqtt-prod:
+  stage: send-to-mqtt
+  image: emqx/mqttx-cli
+  script:
+    - cat $PROD_ENV_FILE >> .env && source .env
+    - CHARLES_GO_VERSION=$(cat bin/version.txt)
+    - SHA256=$(sha256sum bin/CharlesGo | awk '{print $1}')
+    - MQTT_TOPIC="environments/$ENVIRONMENT/charles-go/version"
+    - |
+      MQTT_MESSAGE=$(cat <<EOF
+      {
+        "version": "$CHARLES_GO_VERSION",
+        "sha256sum": "$SHA256"
+      }
+      EOF
+      )
+    - mqttx pub -h $MQTT_BROKER -p $MQTT_PORT -u $MQTT_USER_DEPLOY -P "$MQTT_PASS_DEPLOY" -t $MQTT_TOPIC -m "$MQTT_MESSAGE" --insecure -r --qos 2 --protocol mqtts
+  only:
+    - tags
